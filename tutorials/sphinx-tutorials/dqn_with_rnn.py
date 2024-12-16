@@ -355,7 +355,12 @@ policy = Seq(feature, lstm.set_recurrent_mode(True), mlp, qval)
 # Because we still have a couple of uninitialized parameters we should
 # initialize them before creating an optimizer and such.
 #
-policy(env.reset())
+#print(env.reset())
+#print("before lstm")
+#print(feature(env.reset()))
+#print("Policy on reset")
+print(policy(env.reset()))
+#exit(0)
 
 ######################################################################
 # DQN Loss
@@ -429,6 +434,9 @@ for i, data in enumerate(collector):
     rb.extend(data.unsqueeze(0).to_tensordict().cpu())
     for _ in range(utd):
         s = rb.sample().to(device, non_blocking=True)
+        print(f"Sampled batch {s}")
+        print(f"Step count {s['step_count']}")
+        exit(0)
         loss_vals = loss_fn(s)
         loss_vals["loss"].backward()
         optim.step()

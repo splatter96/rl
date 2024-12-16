@@ -39,6 +39,9 @@ from torchrl.objectives import SoftUpdate
 from torchrl.objectives.sac import DiscreteSACLoss
 from torchrl.record import VideoRecorder
 
+from tensordict.nn import TensorDictSequential
+from torchrl.modules import LSTMModule
+
 
 # ====================================================================
 # Environment utils
@@ -78,11 +81,20 @@ def apply_env_transforms(env, max_episode_steps):
 
 def make_environment(cfg, logger=None):
     """Make environments for training and evaluation."""
+    device = cfg.collector.device
+    if device in ("", None):
+        if torch.cuda.is_available():
+            device = "cuda:0"
+        else:
+            device = "cpu"
     maker = functools.partial(env_maker, cfg)
-    parallel_env = ParallelEnv(
-        cfg.collector.env_per_collector,
-        EnvCreator(maker),
-        serial_for_single=True,
+    #parallel_env = ParallelEnv(
+        #cfg.collector.env_per_collector,
+        #EnvCreator(maker),
+        #serial_for_single=True,
+    #)
+    parallel_env=TransformedEnv(
+        GymEnv("CartPole-v1", from_pixels=False, device=device)
     )
     parallel_env.set_seed(cfg.env.seed)
 
@@ -91,14 +103,22 @@ def make_environment(cfg, logger=None):
     )
 
     maker = functools.partial(env_maker, cfg, from_pixels=cfg.logger.video)
-    eval_env = TransformedEnv(
-        ParallelEnv(
-            cfg.collector.env_per_collector,
-            EnvCreator(maker),
-            serial_for_single=True,
-        ),
-        train_env.transform.clone(),
+    #eval_env = TransformedEnv(
+        #ParallelEnv(
+            #cfg.collector.env_per_collector,
+            #EnvCreator(maker),
+            #serial_for_single=True,
+        #),
+        #train_env.transform.clone(),
+    #)
+
+    eval_env=TransformedEnv(
+        GymEnv("CartPole-v1", from_pixels=False, device=device)
     )
+    eval_env = apply_env_transforms(
+            eval_env, max_episode_steps=cfg.env.max_episode_steps
+    )
+    print(train_env)
     if cfg.logger.video:
         eval_env = eval_env.insert_transform(
             0, VideoRecorder(logger, tag="rendered", in_keys=["pixels"])
@@ -129,6 +149,8 @@ def make_collector(cfg, train_env, actor_model_explore):
         reset_at_each_iter=cfg.collector.reset_at_each_iter,
         device=device,
         storing_device="cpu",
+        #compile_policy=True,
+        #cudagraph_policy=True,
     )
     collector.set_seed(cfg.env.seed)
     return collector
@@ -195,23 +217,55 @@ def make_sac_agent(cfg, train_env, eval_env, device):
         "activation_class": get_activation(cfg),
     }
 
+
     actor_net = MLP(**actor_net_kwargs)
 
     actor_module = SafeModule(
         module=actor_net,
         in_keys=in_keys,
         out_keys=["logits"],
+    ).to(device)
+
+    n_cells = actor_module(train_env.reset())["logits"].shape[-1]
+
+    lstm = LSTMModule(
+	#input_size=action_spec.shape[-1],
+	input_size=n_cells,
+	hidden_size=128,
+	device=device,
+	in_key="logits",
+	out_key="embed",
     )
+
+    lstm_converter_net = MLP(
+            out_features=2,
+            num_cells=[64],
+            device=device
+    )
+    lstm_converter = SafeModule(
+            module=lstm_converter_net,
+            in_keys=["embed"],
+            out_keys=["logits"],
+    )
+
+    train_env.append_transform(lstm.make_tensordict_primer())
+    eval_env.append_transform(lstm.make_tensordict_primer())
+
+    actor1 = TensorDictSequential(actor_module, lstm.set_recurrent_mode(True), lstm_converter)
+
     actor = ProbabilisticActor(
         spec=CompositeSpec(action=eval_env.action_spec),
-        module=actor_module,
+        #module=actor_module,
+        module=actor1,
         in_keys=["logits"],
+        #in_keys=["embed"],
         out_keys=["action"],
         distribution_class=OneHotCategorical,
         distribution_kwargs={},
         default_interaction_type=InteractionType.RANDOM,
         return_log_prob=False,
     )
+
 
     # Define Critic Network
     qvalue_net_kwargs = {
@@ -232,8 +286,15 @@ def make_sac_agent(cfg, train_env, eval_env, device):
     model = torch.nn.ModuleList([actor, qvalue]).to(device)
     # init nets
     with torch.no_grad(), set_exploration_type(ExplorationType.RANDOM):
-        td = eval_env.reset()
+        #td = eval_env.reset()
+        td = train_env.reset()
         td = td.to(device)
+        print(td)
+        print()
+        print("actor model")
+        print(actor_module(td))
+        print()
+        print(actor1(td))
         for net in model:
             net(td)
     del td
